@@ -552,6 +552,227 @@ server_tokens server_tokens::clone() const {
     return res;
 }
 
+// Serialization helpers
+static bool write_u32(std::vector<uint8_t> & out, uint32_t val) {
+    size_t start = out.size();
+    out.resize(start + sizeof(val));
+    memcpy(out.data() + start, &val, sizeof(val));
+    return true;
+}
+
+static bool write_u64(std::vector<uint8_t> & out, uint64_t val) {
+    size_t start = out.size();
+    out.resize(start + sizeof(val));
+    memcpy(out.data() + start, &val, sizeof(val));
+    return true;
+}
+
+static bool write_bytes(std::vector<uint8_t> & out, const void * data, size_t size) {
+    size_t start = out.size();
+    out.resize(start + size);
+    memcpy(out.data() + start, data, size);
+    return true;
+}
+
+static bool read_u32(const uint8_t * & ptr, const uint8_t * end, uint32_t & val) {
+    if (ptr + sizeof(val) > end) return false;
+    memcpy(&val, ptr, sizeof(val));
+    ptr += sizeof(val);
+    return true;
+}
+
+static bool read_u64(const uint8_t * & ptr, const uint8_t * end, uint64_t & val) {
+    if (ptr + sizeof(val) > end) return false;
+    memcpy(&val, ptr, sizeof(val));
+    ptr += sizeof(val);
+    return true;
+}
+
+static bool read_bytes(const uint8_t * & ptr, const uint8_t * end, void * data, size_t size) {
+    if (ptr + size > end) return false;
+    memcpy(data, ptr, size);
+    ptr += size;
+    return true;
+}
+
+// Magic number for slot save files: "llms" (llama server)
+#define SERVER_TOKENS_MAGIC 0x73736C6C
+#define SERVER_TOKENS_VERSION 1
+
+size_t server_tokens::serialize(std::vector<uint8_t> & out) const {
+    out.clear();
+    
+    // Write magic number
+    if (!write_u32(out, SERVER_TOKENS_MAGIC)) return 0;
+    
+    // Write version
+    if (!write_u32(out, SERVER_TOKENS_VERSION)) return 0;
+    
+    // Write has_mtmd flag
+    uint32_t has_mtmd_flag = has_mtmd ? 1 : 0;
+    if (!write_u32(out, has_mtmd_flag)) return 0;
+    
+    // Write total token count
+    uint64_t n_tokens = tokens.size();
+    if (!write_u64(out, n_tokens)) return 0;
+    
+    // Write all tokens
+    if (!write_bytes(out, tokens.data(), n_tokens * sizeof(llama_token))) return 0;
+    
+    // Write chunk count
+    uint64_t n_chunks = map_idx_to_media.size();
+    if (!write_u64(out, n_chunks)) return 0;
+    
+    // Write each chunk
+    for (const auto & [idx, chunk_ptr] : map_idx_to_media) {
+        const auto * chunk = chunk_ptr.get();
+        if (!chunk) continue;
+        
+        // Write token index where chunk starts
+        uint64_t chunk_idx = idx;
+        if (!write_u64(out, chunk_idx)) return 0;
+        
+        // Write chunk type
+        uint32_t chunk_type = mtmd_input_chunk_get_type(chunk);
+        if (!write_u32(out, chunk_type)) return 0;
+        
+        // Write number of positions
+        llama_pos n_pos = mtmd_input_chunk_get_n_pos(chunk);
+        if (!write_u64(out, (uint64_t)n_pos)) return 0;
+        
+        // Write number of tokens in chunk
+        size_t n_tok = mtmd_input_chunk_get_n_tokens(chunk);
+        if (!write_u64(out, n_tok)) return 0;
+        
+        // Write text tokens (if any)
+        size_t n_text_tokens;
+        const llama_token * text_tokens = mtmd_input_chunk_get_tokens_text(chunk, &n_text_tokens);
+        if (!write_u64(out, n_text_tokens)) return 0;
+        if (n_text_tokens > 0 && !write_bytes(out, text_tokens, n_text_tokens * sizeof(llama_token))) {
+            return 0;
+        }
+        
+        // For image chunks, write metadata (image tokens array not accessible via public API)
+        if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+            // Note: Cannot serialize actual image token values as mtmd_image_tokens is opaque.
+            // The token count and position info is captured in n_tokens/n_pos above.
+            // Full restoration requires re-processing the original image data.
+            uint64_t n_img = 0;
+            if (!write_u64(out, n_img)) return 0;
+        }
+    }
+    
+    return out.size();
+}
+
+bool server_tokens::deserialize(const uint8_t * data, size_t size) {
+    const uint8_t * ptr = data;
+    const uint8_t * end = data + size;
+    
+    // Read and verify magic
+    uint32_t magic;
+    if (!read_u32(ptr, end, magic) || magic != SERVER_TOKENS_MAGIC) {
+        return false;
+    }
+    
+    // Read version
+    uint32_t version;
+    if (!read_u32(ptr, end, version) || version != SERVER_TOKENS_VERSION) {
+        return false;
+    }
+    
+    // Read has_mtmd flag
+    uint32_t has_mtmd_flag;
+    if (!read_u32(ptr, end, has_mtmd_flag)) return false;
+    has_mtmd = has_mtmd_flag ? true : false;
+    
+    // Read token count and tokens
+    uint64_t n_tokens;
+    if (!read_u64(ptr, end, n_tokens)) return false;
+    
+    llama_tokens raw_tokens;
+    raw_tokens.resize(n_tokens);
+    if (n_tokens > 0) {
+        if (!read_bytes(ptr, end, raw_tokens.data(), n_tokens * sizeof(llama_token))) {
+            return false;
+        }
+    }
+    
+    // Read chunk count
+    uint64_t n_chunks;
+    if (!read_u64(ptr, end, n_chunks)) return false;
+    
+    // Clear existing media map - we cannot reconstruct mtmd_input_chunk objects
+    // without the original image/audio data. The map will be repopulated when
+    // new multimodal prompts are processed.
+    map_idx_to_media.clear();
+    
+    // Skip over chunk data in the file (we're not using it)
+    for (uint64_t i = 0; i < n_chunks; i++) {
+        uint64_t chunk_idx;
+        if (!read_u64(ptr, end, chunk_idx)) return false;
+        
+        uint32_t chunk_type;
+        if (!read_u32(ptr, end, chunk_type)) return false;
+        
+        uint64_t n_pos;
+        if (!read_u64(ptr, end, n_pos)) return false;
+        
+        size_t n_tok;
+        if (!read_u64(ptr, end, n_tok)) return false;
+        
+        // Skip text tokens
+        size_t n_text_tokens;
+        if (!read_u64(ptr, end, n_text_tokens)) return false;
+        if (n_text_tokens > 0) {
+            // Just skip over the bytes without reading them
+            const uint8_t * skip_end = ptr + n_text_tokens * sizeof(llama_token);
+            if (skip_end > end) return false;
+            ptr = skip_end;
+        }
+        
+        // Skip image tokens if applicable
+        if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+            uint64_t n_img;
+            if (!read_u64(ptr, end, n_img)) return false;
+            if (n_img > 0) {
+                const uint8_t * skip_end = ptr + n_img * sizeof(llama_token);
+                if (skip_end > end) return false;
+                ptr = skip_end;
+            }
+        }
+    }
+    
+    // Filter out NULL token placeholders (image positions) since we can't
+    // reconstruct the actual image chunks. The KV cache will still be restored
+    // separately, but the tokens will only contain text.
+    tokens.clear();
+    tokens.reserve(n_tokens);
+    for (size_t i = 0; i < n_tokens; i++) {
+        if (raw_tokens[i] != LLAMA_TOKEN_NULL) {
+            tokens.push_back(raw_tokens[i]);
+        }
+    }
+    
+    return true;
+}
+
+std::vector<server_tokens::chunk_info> server_tokens::get_chunks() const {
+    std::vector<chunk_info> result;
+    for (const auto & [idx, chunk_ptr] : map_idx_to_media) {
+        const auto * chunk = chunk_ptr.get();
+        if (!chunk) continue;
+        
+        chunk_info info;
+        info.token_idx = idx;
+        info.type = mtmd_input_chunk_get_type(chunk);
+        info.n_pos = mtmd_input_chunk_get_n_pos(chunk);
+        info.n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
+        result.push_back(info);
+    }
+    return result;
+}
+
 //
 // tokenizer and input processing utils
 //

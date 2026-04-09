@@ -1829,10 +1829,6 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_SAVE:
                 {
-                    if (!check_no_mtmd(task.id)) {
-                        break;
-                    }
-
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
@@ -1846,13 +1842,28 @@ private:
                         break;
                     }
 
-                    const size_t token_count = slot->prompt.tokens.size();
                     const int64_t t_start = ggml_time_us();
 
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
 
-                    const llama_tokens & tokens = slot->prompt.tokens.get_text_tokens();
+                    // Serialize server_tokens (including multimodal data) to sidecar file
+                    std::string stokens_path = filepath + ".stokens";
+                    std::vector<uint8_t> stokens_data;
+                    size_t stokens_size = slot->prompt.tokens.serialize(stokens_data);
+                    
+                    // Write sidecar file
+                    if (stokens_size > 0) {
+                        FILE * fp = fopen(stokens_path.c_str(), "wb");
+                        if (fp) {
+                            fwrite(stokens_data.data(), 1, stokens_size, fp);
+                            fclose(fp);
+                        }
+                    }
+
+                    // Use all tokens (text + image positions) for KV cache save
+                    const llama_tokens & tokens = slot->prompt.tokens.get_all_tokens();
+                    const size_t token_count = tokens.size();
                     const size_t nwrite = llama_state_seq_save_file(ctx, filepath.c_str(), slot->id, tokens.data(), token_count);
 
                     const int64_t t_end = ggml_time_us();
@@ -1864,13 +1875,12 @@ private:
                     res->filename = filename;
                     res->is_save  = true;
                     res->n_tokens = token_count;
-                    res->n_bytes  = nwrite;
+                    res->n_bytes  = nwrite + stokens_size;
                     res->t_ms     = t_save_ms;
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SLOT_RESTORE:
                 {
-                    if (!check_no_mtmd(task.id)) break;
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
@@ -1889,6 +1899,26 @@ private:
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
 
+                    // Try to load server_tokens from sidecar file first
+                    std::string stokens_path = filepath + ".stokens";
+                    FILE * fp_stokens = fopen(stokens_path.c_str(), "rb");
+                    if (fp_stokens) {
+                        fseek(fp_stokens, 0, SEEK_END);
+                        long stokens_size = ftell(fp_stokens);
+                        fseek(fp_stokens, 0, SEEK_SET);
+                        
+                        if (stokens_size > 0) {
+                            std::vector<uint8_t> stokens_data(stokens_size);
+                            fread(stokens_data.data(), 1, stokens_size, fp_stokens);
+                            fclose(fp_stokens);
+                            
+                            // Deserialize server_tokens
+                            slot->prompt.tokens.deserialize(stokens_data.data(), stokens_data.size());
+                        } else {
+                            fclose(fp_stokens);
+                        }
+                    }
+
                     llama_tokens tokens;
                     tokens.resize(slot->n_ctx);
                     size_t token_count = 0;
@@ -1899,8 +1929,12 @@ private:
                         break;
                     }
                     tokens.resize(token_count);
-                    slot->prompt.tokens.clear();
-                    slot->prompt.tokens.insert(tokens);
+                    
+                    // If we didn't load from sidecar, use the loaded tokens
+                    if (slot->prompt.tokens.empty()) {
+                        slot->prompt.tokens.clear();
+                        slot->prompt.tokens.insert(tokens);
+                    }
 
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
@@ -1917,9 +1951,6 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_ERASE:
                 {
-                    if (!check_no_mtmd(task.id)) {
-                        break;
-                    }
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {

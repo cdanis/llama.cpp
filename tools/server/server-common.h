@@ -189,6 +189,9 @@ public:
     // for compatibility with speculative decoding, ctx shift, slot save/load
     const llama_tokens & get_text_tokens() const;
 
+    // for slot save/load - returns all tokens (text + image positions)
+    const llama_tokens & get_all_tokens() const { return tokens; }
+
     // for compatibility with speculative decoding
     void set_token(llama_pos pos, llama_token id);
 
@@ -220,6 +223,19 @@ public:
                 size_t & n_tokens_out) const;
 
     server_tokens clone() const;
+
+    // Serialization for slot save/restore
+    size_t serialize(std::vector<uint8_t> & out) const;
+    bool deserialize(const uint8_t * data, size_t size);
+
+    // Get chunk info at position (for serialization)
+    struct chunk_info {
+        size_t token_idx;
+        enum mtmd_input_chunk_type type;
+        llama_pos n_pos;
+        size_t n_tokens;
+    };
+    std::vector<chunk_info> get_chunks() const;
 };
 
 
