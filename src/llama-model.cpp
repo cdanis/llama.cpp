@@ -361,6 +361,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_q_bias          ("blk\\.\\d*\\.attn_q\\.bias");
     static const std::regex pattern_kv_bias         ("blk\\.\\d*\\.attn_(k|v)\\.bias");
     static const std::regex pattern_qkv_bias        ("blk\\.\\d*\\.attn_qkv.bias");
+    static const std::regex pattern_ssm_in_weight   ("blk\\.\\d*\\.ssm_in\\.weight");
     static const std::regex pattern_qk_norm         ("blk\\.\\d*\\.attn_(q|k)_norm\\.weight");
     static const std::regex pattern_kv_cache        ("cache_(k|v)_l\\d*");
     static const std::regex pattern_attn_sinks      ("blk\\.\\d*\\.attn_sinks.weight");
@@ -449,7 +450,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         if (std::regex_match(tensor_name, pattern_q_bias) || std::regex_match(tensor_name, pattern_kv_bias)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight", "ssm_out.weight");
         }
-        if (std::regex_match(tensor_name, pattern_qkv_weight)) {
+        if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_ssm_in_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
         }
         if ( std::regex_match(tensor_name, pattern_qkv_bias)) {
@@ -539,6 +540,21 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                     GGML_ASSERT(tensor->ne[axis] == 2*key_dim + value_dim);
                     return {{key_dim, 2}, {value_dim, 1}};
                 }
+                if (std::regex_match(tensor_name, pattern_ssm_in_weight)) {
+                    // legacy qkv projection: q, k, v, z (z is the delta-net gate).
+                    // keep the split flat but head-block aligned: the legacy graph views the
+                    // output with per-head strides, so the device slices must be contiguous
+                    // head blocks, not per-chunk segments.
+                    GGML_ASSERT(tensor->ne[axis] == 2*key_dim + 2*value_dim);
+                    return {{tensor->ne[axis], 1}};
+                }
+                if (std::regex_match(tensor_name, pattern_r_cache)) {
+                    // conv state is slot-major [d_conv-1, channels]; split per slot so each
+                    // device gets its channel range of every slot
+                    const int64_t conv_channels = hparams.ssm_d_inner + 2*hparams.ssm_n_group*hparams.ssm_d_state;
+                    GGML_ASSERT(tensor->ne[axis] == (hparams.ssm_d_conv - 1)*conv_channels);
+                    return {{conv_channels, (uint32_t)(hparams.ssm_d_conv - 1)}};
+                }
             } else {
                 const int64_t head_ratio = n_v_heads / n_k_heads;
                 if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_ssm_conv1d)) {
@@ -599,7 +615,15 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             const int64_t head_dim        = hparams.ssm_d_state;
             const int64_t blck_size_perf  = std::lcm(blck_size, 128);
             const int64_t granularity_qkv = std::lcm(blck_size_perf, head_dim);
-            if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_attn_gate_weight) ||
+            if (std::regex_match(tensor_name, pattern_ssm_in_weight)) {
+                // legacy qkv projection: split aligned to per-k-head blocks so the
+                // head-strided views in the legacy graph stay consistent on each device
+                const int64_t head_ratio = hparams.ssm_dt_rank / hparams.ssm_n_group;
+                const int64_t head_block = 2*head_dim*(1 + head_ratio);
+                return std::vector<int64_t>(segments.size(), std::lcm(blck_size_perf, head_block));
+            }
+            if (std::regex_match(tensor_name, pattern_qkv_weight) ||
+                    std::regex_match(tensor_name, pattern_attn_gate_weight) ||
                     std::regex_match(tensor_name, pattern_ssm_conv1d) || std::regex_match(tensor_name, pattern_ssm_out_weight)) {
                 return std::vector<int64_t>(segments.size(), granularity_qkv);
             }

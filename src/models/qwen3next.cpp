@@ -343,6 +343,8 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen3next::graph::build_qkvz
 
         int64_t       qkvz_new_dim        = 2 * head_k_dim + 2 * head_v_dim * (num_v_heads / num_k_heads);
         ggml_tensor * mixed_qkvz_reshaped = ggml_reshape_4d(ctx0, mixed_qkvz, qkvz_new_dim, num_k_heads, n_seq_tokens, n_seqs);
+        // materialize so the split views below point at per-device data instead of a nested view
+        mixed_qkvz_reshaped = ggml_cont_4d(ctx0, mixed_qkvz_reshaped, qkvz_new_dim, num_k_heads, n_seq_tokens, n_seqs);
 
         // Split mixed_qkvz into query, key, value, z
         int64_t split_sizes_qkvz[4] = {

@@ -545,7 +545,19 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     // Some ops broadcast the src1 data across src0:
+    // elementwise binary ops: result split state can follow either operand, since a full
+    // (mirrored) operand combines correctly with any split operand on a per-slice basis
     auto handle_bin_bcast = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        if (src_ss[0].axis >= 0 && src_ss[0].axis < GGML_MAX_DIMS && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            return src_ss[0];
+        }
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[1].axis >= 0 && src_ss[1].axis < GGML_MAX_DIMS) {
+            return src_ss[1];
+        }
+        return handle_generic(src_ss, /*scalar_only =*/ false);
+    };
+
+    auto handle_add_id = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         if (src_ss[0].axis >= 0 && src_ss[0].axis < GGML_MAX_DIMS &&
                 tensor->src[1]->ne[src_ss[0].axis] == 1 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return src_ss[0];
@@ -570,6 +582,17 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         }
         if (src_ss[0].axis == src_ss[1].axis && src_ss[0].axis != concat_axis) {
             return src_ss[0];
+        }
+        if (src_ss[0].axis == src_ss[1].axis && src_ss[0].axis >= 0 && src_ss[0].axis < GGML_MAX_DIMS &&
+                src_ss[0].axis == concat_axis) {
+            // concatenating along the split axis: the per-device slice is the sum of the input slices
+            GGML_ASSERT(src_ss[0].n_segments == 1 && src_ss[1].n_segments == 1);
+            GGML_ASSERT(src_ss[0].nr[0] == 1 && src_ss[1].nr[0] == 1);
+            ggml_backend_meta_split_state ret = src_ss[0];
+            for (size_t j = 0; j < n_bufs; j++) {
+                ret.ne[j] = src_ss[0].ne[j] + src_ss[1].ne[j];
+            }
+            return ret;
         }
         return handle_generic(src_ss, /*scalar_only =*/ true);
     };
@@ -824,9 +847,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_DUP: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
-            case GGML_OP_ADD:
-            case GGML_OP_ADD_ID: {
+            case GGML_OP_ADD: {
                 split_state = handle_bin_bcast(src_ss);
+            } break;
+            case GGML_OP_ADD_ID: {
+                split_state = handle_add_id(src_ss);
             } break;
             case GGML_OP_ADD1:
             case GGML_OP_ACC: {
