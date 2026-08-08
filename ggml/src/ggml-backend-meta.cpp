@@ -544,10 +544,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return src_ss[0];
     };
 
-    // Some ops broadcast the src1 data across src0:
-    // elementwise binary ops: result split state can follow either operand, since a full
-    // (mirrored) operand combines correctly with any split operand on a per-slice basis
-    auto handle_bin_bcast = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+    // elementwise binary ops: a mirrored operand combines correctly with an operand split on any axis
+    auto handle_bin_elemwise = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         if (src_ss[0].axis >= 0 && src_ss[0].axis < GGML_MAX_DIMS && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return src_ss[0];
         }
@@ -848,7 +846,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
             case GGML_OP_ADD: {
-                split_state = handle_bin_bcast(src_ss);
+                split_state = handle_bin_elemwise(src_ss);
             } break;
             case GGML_OP_ADD_ID: {
                 split_state = handle_add_id(src_ss);
@@ -860,7 +858,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_SUB:
             case GGML_OP_MUL:
             case GGML_OP_DIV: {
-                split_state = handle_bin_bcast(src_ss);
+                split_state = handle_bin_elemwise(src_ss);
             } break;
             case GGML_OP_SQR:
             case GGML_OP_SQRT:

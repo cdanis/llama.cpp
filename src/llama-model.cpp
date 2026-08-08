@@ -361,7 +361,6 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_q_bias          ("blk\\.\\d*\\.attn_q\\.bias");
     static const std::regex pattern_kv_bias         ("blk\\.\\d*\\.attn_(k|v)\\.bias");
     static const std::regex pattern_qkv_bias        ("blk\\.\\d*\\.attn_qkv.bias");
-    static const std::regex pattern_ssm_in_weight   ("blk\\.\\d*\\.ssm_in\\.weight");
     static const std::regex pattern_qk_norm         ("blk\\.\\d*\\.attn_(q|k)_norm\\.weight");
     static const std::regex pattern_kv_cache        ("cache_(k|v)_l\\d*");
     static const std::regex pattern_attn_sinks      ("blk\\.\\d*\\.attn_sinks.weight");
@@ -369,6 +368,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_attn_out_bias   ("blk\\.\\d*\\.attn_output.bias");
     static const std::regex pattern_attn_gate_weight("blk\\.\\d*\\.attn_gate.weight");
 
+    static const std::regex pattern_ssm_in_weight   ("blk\\.\\d*\\.ssm_in\\.weight");
     static const std::regex pattern_ssm_dt          ("blk\\.\\d*\\.ssm_dt.bias");
     static const std::regex pattern_ssm_a           ("blk\\.\\d*\\.ssm_a");
     static const std::regex pattern_ssm_alpha       ("blk\\.\\d*\\.ssm_alpha.weight");
@@ -542,9 +542,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 }
                 if (std::regex_match(tensor_name, pattern_ssm_in_weight)) {
                     // legacy qkv projection: q, k, v, z (z is the delta-net gate).
-                    // keep the split flat but head-block aligned: the legacy graph views the
-                    // output with per-head strides, so the device slices must be contiguous
-                    // head blocks, not per-chunk segments.
+                    // flat split so the per-head-strided views stay consistent per device
                     GGML_ASSERT(tensor->ne[axis] == 2*key_dim + 2*value_dim);
                     return {{tensor->ne[axis], 1}};
                 }
@@ -616,8 +614,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             const int64_t blck_size_perf  = std::lcm(blck_size, 128);
             const int64_t granularity_qkv = std::lcm(blck_size_perf, head_dim);
             if (std::regex_match(tensor_name, pattern_ssm_in_weight)) {
-                // legacy qkv projection: split aligned to per-k-head blocks so the
-                // head-strided views in the legacy graph stay consistent on each device
+                // split aligned to per-k-head blocks
                 const int64_t head_ratio = hparams.ssm_dt_rank / hparams.ssm_n_group;
                 const int64_t head_block = 2*head_dim*(1 + head_ratio);
                 return std::vector<int64_t>(segments.size(), std::lcm(blck_size_perf, head_block));
