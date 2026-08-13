@@ -107,6 +107,7 @@ enum llama_example {
     LLAMA_EXAMPLE_EXPORT_GRAPH_OPS,
     LLAMA_EXAMPLE_DOWNLOAD,
     LLAMA_EXAMPLE_TOKENIZE,
+    LLAMA_EXAMPLE_LOGITS_HASH,
 
     LLAMA_EXAMPLE_COUNT,
 };
@@ -444,7 +445,11 @@ struct common_params {
     int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
+    int32_t n_logits_tokens       =     0; // max number of logits tokens to hash (0 = all)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
+    // logits hashing (llama-logits-hash): xxh64 by default, sha1/sha256 optional
+    bool    logits_hash_sha1      = false;
+    bool    logits_hash_sha256    = false;
     int32_t n_sequences           =     1; // number of sequences to decode
     int32_t n_outputs_max         =     0; // max outputs in a batch (0 = n_batch)
     int32_t n_outputs_max_per_seq =     1; // max outputs per sequence

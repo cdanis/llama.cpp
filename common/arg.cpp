@@ -1732,6 +1732,35 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.n_chunks = value;
         }
     ).set_examples({LLAMA_EXAMPLE_IMATRIX, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_RETRIEVAL}));
+    add_opt(common_arg(
+        {"--tokens"}, "N",
+        string_format("max number of logits tokens to hash (default: %d, 0 = all)", params.n_logits_tokens),
+        [](common_params & params, int value) {
+            params.n_logits_tokens = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_LOGITS_HASH}));
+    add_opt(common_arg(
+        {"--sha1"},
+        "use sha1 for logits hashing (default: xxh64)",
+        [](common_params & params) {
+            params.logits_hash_sha1 = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_LOGITS_HASH}));
+    add_opt(common_arg(
+        {"--sha256"},
+        "use sha256 for logits hashing (default: xxh64)",
+        [](common_params & params) {
+            params.logits_hash_sha256 = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_LOGITS_HASH}));
+    add_opt(common_arg(
+        {"--all"},
+        "use all available hashes",
+        [](common_params & params) {
+            params.logits_hash_sha1 = true;
+            params.logits_hash_sha256 = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_LOGITS_HASH}));
     add_opt(common_arg({ "-fa", "--flash-attn" }, "[on|off|auto]",
                        string_format("set Flash Attention use ('on', 'off', or 'auto', default: '%s')",
                                      llama_flash_attn_type_name(params.flash_attn_type)),
