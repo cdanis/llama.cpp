@@ -721,6 +721,9 @@ struct llama_model {
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 
+    // local unsplit copy of tensor `name` from `src`; used by DFlash drafts sharing tok_embd/output
+    struct ggml_tensor * copy_tensor_from(const struct llama_model * src, const char * name);
+
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;
 

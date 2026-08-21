@@ -11,6 +11,7 @@
 #include "sampling.h"
 
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
+#include "../src/llama-model.h" // complete llama_model type: DFlash draft gets local copies of the shared tok_embd/output
 
 #include <algorithm>
 #include <cassert>
@@ -2303,7 +2304,11 @@ common_speculative_type common_speculative_type_from_name(const std::string & na
     return it->second;
 }
 
-std::vector<common_speculative_type> common_speculative_types_from_gguf(const std::string & path) {
+std::vector<common_speculative_type> common_speculative_types_from_gguf(const std::string & path, bool * is_dflash2) {
+    if (is_dflash2) {
+        *is_dflash2 = false;
+    }
+
     struct gguf_init_params gguf_params = {
         /* .no_alloc = */ true,
         /* .ctx      = */ nullptr,
@@ -2314,7 +2319,8 @@ std::vector<common_speculative_type> common_speculative_types_from_gguf(const st
         return {};
     }
 
-    const int64_t arch_id = gguf_find_key(gguf_ctx.get(), "general.architecture");
+    const LLM_KV llm_kv = LLM_KV(LLM_ARCH_DFLASH);
+    const int64_t arch_id = gguf_find_key(gguf_ctx.get(), llm_kv(LLM_KV_GENERAL_ARCHITECTURE).c_str());
     if (arch_id < 0 || gguf_get_kv_type(gguf_ctx.get(), arch_id) != GGUF_TYPE_STRING) {
         return {};
     }
@@ -2328,6 +2334,12 @@ std::vector<common_speculative_type> common_speculative_types_from_gguf(const st
         }
 
         return {};
+    }
+
+    // DFlash2 adds a candidate selector on top of DFlash (dflash.selector_top_k > 0)
+    if (is_dflash2) {
+        const int64_t sel_k_id = gguf_find_key(gguf_ctx.get(), llm_kv(LLM_KV_DFLASH_SELECTOR_TOP_K).c_str());
+        *is_dflash2 = sel_k_id >= 0 && gguf_get_val_u32(gguf_ctx.get(), sel_k_id) > 0;
     }
 
     // the Markov head distinguishes draft-dspark from draft-dflash
@@ -2451,6 +2463,10 @@ common_speculative_init_result::common_speculative_init_result(
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
+    // DFlash2 selector GGML_OP_TOPK over row-split vocab logits is an unsupported meta reduction
+    // (AXIS_0 assert); force LAYER only for DFlash2 - DFlash1 and other drafts tensor-split fine.
+    const bool target_tensor_split = (mparams.split_mode == LLAMA_SPLIT_MODE_TENSOR);
+
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
     }
@@ -2465,6 +2481,13 @@ common_speculative_init_result::common_speculative_init_result(
         model_path = params.speculative.draft.mparams.path;
         LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
 
+        bool draft_is_dflash2 = false;
+        common_speculative_types_from_gguf(model_path, &draft_is_dflash2);
+        if (target_tensor_split && draft_is_dflash2) {
+            mparams.split_mode = LLAMA_SPLIT_MODE_LAYER;
+            LOG_INF("%s: forcing DFlash2 draft split_mode = LLAMA_SPLIT_MODE_LAYER: candidate selector cannot be tensor-split\n", __func__);
+        }
+
         llama_model * model_dft = llama_model_load_from_file(params.model.path.c_str(), mparams);
         if (model_dft == NULL) {
             LOG_ERR("%s: failed to load draft model, '%s'\n", __func__, model_path.c_str());
@@ -2472,6 +2495,18 @@ common_speculative_init_result::common_speculative_init_result(
         }
 
         pimpl->model.reset(model_dft);
+
+        // shared tok_embd/output (ctx_other) live in the target Meta() buffer:
+        // materialize local copies so the draft scheduler can run them
+        if (target_tensor_split && model_tgt != nullptr) {
+            if (model_dft->tok_embd == nullptr) {
+                model_dft->tok_embd = model_dft->copy_tensor_from(model_tgt, "token_embd.weight");
+            }
+            if (model_dft->output == nullptr) {
+                model_dft->output   = model_dft->copy_tensor_from(model_tgt, "output.weight");
+                model_dft->output_s = model_dft->copy_tensor_from(model_tgt, "output.scale");
+            }
+        }
 
         llama_context * ctx_dft = llama_init_from_model(model_dft, cparams);
         if (ctx_dft == nullptr) {

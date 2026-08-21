@@ -3016,3 +3016,47 @@ uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out)
 
     return (uint32_t) nelements;
 }
+
+// local unsplit copy of `src` tensor `name`; token_embd on CPU, the rest on the output device
+struct ggml_tensor * llama_model::copy_tensor_from(const struct llama_model * src, const char * name) {
+    const ggml_tensor * src_t = src->get_tensor(name);
+    if (src_t == nullptr) {
+        return nullptr;
+    }
+
+    ggml_backend_buffer_type_t buft;
+    if (strcmp(name, "token_embd.weight") == 0) {
+        buft = ggml_backend_cpu_buffer_type();
+    } else {
+        GGML_ASSERT(!pimpl->dev_output.buft_list->empty());
+        buft = pimpl->dev_output.buft_list->front().second;
+    }
+
+    ggml_context_ptr ctx_ptr { ggml_init({ /*.mem_size =*/ ggml_tensor_overhead()*8, /*.mem_buffer =*/ NULL, /*.no_alloc =*/ true }) };
+    if (!ctx_ptr) {
+        return nullptr;
+    }
+
+    ggml_tensor * t = ggml_dup_tensor(ctx_ptr.get(), src_t);
+    ggml_set_name(t, name);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx_ptr.get(), buft);
+    if (buf == nullptr) {
+        return nullptr;
+    }
+
+    ggml_backend_buffer_ptr buf_ptr { buf };
+    ggml_backend_buffer_set_usage(buf_ptr.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    // copy the source data (handles a split source and host/device targets), then keep the buffer alive
+    ggml_backend_tensor_copy(src_t, t);
+
+    std::vector<ggml_backend_buffer_ptr> bufs;
+    bufs.emplace_back(std::move(buf_ptr));
+    pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
+
+    LLAMA_LOG_INFO("%s: copied tensor '%s' (%s, %zu MiB) from the source model\n",
+            __func__, name, ggml_type_name(t->type), ggml_nbytes(t)/1024/1024);
+
+    return t;
+}
